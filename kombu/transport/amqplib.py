@@ -11,6 +11,7 @@ amqplib transport.
 from __future__ import absolute_import
 
 import socket
+import sys
 
 try:
     from ssl import SSLError
@@ -249,6 +250,14 @@ class Transport(base.Transport):
     def drain_events(self, connection, **kwargs):
         return connection.drain_events(**kwargs)
 
+    #
+    # Uses a very basic mechanism for now:
+    #   * try to connect to every server on every connection attempt
+    #   * first one where the connection succeeds is returned
+    #   * failing servers are removed form the list for this connection attempt
+    #     (they will be retried on the next attempt)
+    #   * if all servers fail once we raise the connection error
+    #
     def establish_connection(self):
         """Establish connection to the AMQP broker."""
         conninfo = self.client
@@ -257,16 +266,32 @@ class Transport(base.Transport):
                 setattr(conninfo, name, default_value)
         if conninfo.hostname == "localhost":
             conninfo.hostname = "127.0.0.1"
-        conn = self.Connection(host=conninfo.host,
-                               userid=conninfo.userid,
-                               password=conninfo.password,
-                               login_method=conninfo.login_method,
-                               virtual_host=conninfo.virtual_host,
-                               insist=conninfo.insist,
-                               ssl=conninfo.ssl,
-                               connect_timeout=conninfo.connect_timeout)
-        conn.client = self.client
-        return conn
+
+        if "ha_hosts" in conninfo.transport_options:
+            self._servers = list(conninfo.transport_options["ha_hosts"])
+        else:
+            self._servers = [conninfo.host]
+
+        for _ in range(len(self._servers)):
+            try:
+                self.client._debug("[amqlib transport] connecting to %s" % self._servers[0])
+                conn = self.Connection(host=self._servers[0],
+                                       userid=conninfo.userid,
+                                       password=conninfo.password,
+                                       login_method=conninfo.login_method,
+                                       virtual_host=conninfo.virtual_host,
+                                       insist=conninfo.insist,
+                                       ssl=conninfo.ssl,
+                                       connect_timeout=conninfo.connect_timeout)
+                conn.client = self.client
+                return conn
+
+            except self.connection_errors, exc:
+                self.client._debug("[amqlib transport] connecting to %s failed: %r" % (self._servers[0], exc), exc_info=sys.exc_info())
+                self._servers.remove(self._servers[0])
+
+                if len(self._servers) == 0:
+                    raise
 
     def close_connection(self, connection):
         """Close the AMQP broker connection."""
